@@ -16,12 +16,6 @@ try:
 except Exception as e:
     torch = None
 
-try:
-    # ultralytics YOLOv8 style
-    from ultralytics import YOLO as ULTRAYOLO
-except Exception:
-    ULTRAYOLO = None
-
 # --- DỮ LIỆU CỐ ĐỊNH ---
 CLASS_NAMES = [
     'banh chuoi nuong', 'banh cua bo', 'banh da lon', 'banh mi dua luoi',
@@ -580,5 +574,6 @@ if __name__ == "__main__":
     w = BakeryApp()
     w.show()
     sys.exit(app.exec())
+
 
 
