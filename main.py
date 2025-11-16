@@ -47,8 +47,7 @@ IMG_WIDTH, IMG_HEIGHT = 224, 224
 
 MODELS_DIR = Path("models\keras2")
 MODEL_PATH = MODELS_DIR / "bakery_cnn.h5"
-LABELS_PATH = MODELS_DIR / "labels.txt" 
-PT_MODEL_PATH = "weights.pt"             
+LABELS_PATH = MODELS_DIR / "labels.txt"          
 
 CNN_CONF_THRESHOLD = 0.55  
 YOLO_MIN_AREA = 1500     
@@ -598,3 +597,4 @@ if __name__ == "__main__":
     w = BakeryApp()
     w.show()
     sys.exit(app.exec())
+
