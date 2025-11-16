@@ -1,5 +1,8 @@
-import sys, os, csv, time, numpy as np, tensorflow as tf, cv2
+import sys, os, csv, time, numpy as np, tensorflow as tf, cv2, tempfile
 from datetime import datetime
+from pathlib import Path
+
+# PyQt6
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QFileDialog, QScrollArea
@@ -7,6 +10,17 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPixmap, QFont, QImage
 from PyQt6.QtCore import Qt, QTimer
 
+# optional torch / ultralytics imports (attempt to import gracefully)
+try:
+    import torch
+except Exception as e:
+    torch = None
+
+try:
+    # ultralytics YOLOv8 style
+    from ultralytics import YOLO as ULTRAYOLO
+except Exception:
+    ULTRAYOLO = None
 
 # --- DỮ LIỆU CỐ ĐỊNH ---
 CLASS_NAMES = [
@@ -27,11 +41,21 @@ DISPLAY_NAMES = {
     'croissant': 'Croissant 🥐', 'egg tart': 'Egg Tart 🥚',
     'muffin viet quat': 'Muffin Việt Quất 🫐', 'patechaud': 'Patechaud 🥧'
 }
-IMG_WIDTH, IMG_HEIGHT = 180, 180
-MODEL_PATH = "merged_multi_label_cnn.h5"
 
+# (ĐÃ SỬA LỖI 1: ValueError) Sửa kích thước ảnh khớp với model
+IMG_WIDTH, IMG_HEIGHT = 224, 224
 
-# --- ITEM TRONG BILL ---
+MODELS_DIR = Path("models\keras2")
+MODEL_PATH = MODELS_DIR / "bakery_cnn.h5"
+LABELS_PATH = MODELS_DIR / "labels.txt" 
+PT_MODEL_PATH = "weights.pt"             
+
+CNN_CONF_THRESHOLD = 0.55  
+YOLO_MIN_AREA = 1500     
+YOLO_PADDING = 0.12     
+
+DEBOUNCE_BUTTON_MS = 2500 
+
 class BillItemWidget(QFrame):
     def __init__(self, class_name, price, parent):
         super().__init__()
@@ -66,33 +90,59 @@ class BillItemWidget(QFrame):
             self.qty_label.setText(str(self.quantity))
             self.parent_app.update_total()
 
-
 # --- APP CHÍNH ---
 class BakeryApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("🍞 Tiệm Bánh 3ITECH (AI Smart POS)")
-        self.setGeometry(100, 100, 1200, 700)
-        self.model = None
+        self.setGeometry(170, 170, 1200, 700)
+        self.model = None         # tensorflow CNN model (.h5)
+        self.model_pt = None      # YOLO .pt model (for cropping only)
         self.bill_items, self.last_detected_time = {}, {}
         self.realtime_enabled, self.capture = False, None
         self.current_image_path, self.current_frame = None, None
+        
+        # (ĐÃ THÊM LỖI 3) Biến lưu trữ phát hiện realtime
+        self.current_detections = [] 
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
-        self.load_model()
+        self.load_models()
         self.setup_ui()
         self.apply_style()
 
-    # --- MODEL ---
-    def load_model(self):
+    # --- MODELS LOAD ---
+    # (Không thay đổi)
+    def load_models(self):
+        # load CNN .h5
         if os.path.exists(MODEL_PATH):
-            self.model = tf.keras.models.load_model(MODEL_PATH)
-            print("✅ Model loaded.")
+            try:
+                self.model = tf.keras.models.load_model(MODEL_PATH)
+                print("✅ CNN .h5 model loaded.")
+            except Exception as e:
+                print("❌ Lỗi khi load CNN .h5:", e)
+                self.model = None
         else:
-            print("❌ Không tìm thấy model!")
+            print("❌ Không tìm thấy CNN .h5 model ở", MODEL_PATH)
 
-    # --- UI ---
+        # load YOLO .pt (for cropping only)
+        if os.path.exists(PT_MODEL_PATH):
+            if torch is None:
+                print("⚠️ torch chưa cài, không thể load YOLO .pt. Hãy cài torch + ultralytics/yolov5.")
+                self.model_pt = None
+            else:
+                try:
+                    if ULTRAYOLO is not None:
+                        self.model_pt = ULTRAYOLO(PT_MODEL_PATH)
+                    else:
+                        self.model_pt = torch.hub.load('ultralytics/yolov5', 'custom', PT_MODEL_PATH, force_reload=False)
+                except Exception as e:
+                    self.model_pt = None
+        else:
+            print("⚠️ Không tìm thấy file YOLO .pt ở", PT_MODEL_PATH)
+            self.model_pt = None
+
+    # --- UI (ĐÃ SỬA LỖI 3) ---
     def setup_ui(self):
         main = QHBoxLayout()
 
@@ -113,8 +163,11 @@ class BakeryApp(QMainWindow):
 
         btn_load = QPushButton("📂 TẢI ẢNH TĨNH")
         btn_load.clicked.connect(self.select_image)
-        btn_detect = QPushButton("📸 NHẬN DIỆN ẢNH")
-        btn_detect.clicked.connect(self.run_detection)
+        
+        # (ĐÃ SỬA LỖI 3) Gán self.btn_detect và đổi tên nút
+        self.btn_detect = QPushButton("📸 THÊM BÁNH VÀO HÓA ĐƠN")
+        self.btn_detect.clicked.connect(self.run_detection)
+        
         btn_pay = QPushButton("💰 THANH TOÁN")
         btn_pay.clicked.connect(self.pay_bill)
 
@@ -122,7 +175,7 @@ class BakeryApp(QMainWindow):
         c1.addWidget(self.camera_label)
         c1.addWidget(self.btn_realtime)
         c1.addWidget(btn_load)
-        c1.addWidget(btn_detect)
+        c1.addWidget(self.btn_detect) # (ĐÃ SỬA)
         c1.addWidget(btn_pay)
 
         # BILL
@@ -162,6 +215,7 @@ class BakeryApp(QMainWindow):
         central.setLayout(main)
         self.setCentralWidget(central)
 
+    # (ĐÃ SỬA LỖI 3) Thêm style cho nút
     def apply_style(self):
         self.setStyleSheet("""
             QMainWindow { background-color: #FFF8E1; }
@@ -172,9 +226,21 @@ class BakeryApp(QMainWindow):
                 font-size: 14px; font-weight: bold; padding: 10px; border-radius: 5px;
             }
             QPushButton:hover { background-color: #A1887F; }
+            
+            QPushButton[text="📸 THÊM BÁNH VÀO HÓA ĐƠN"] {
+                background-color: #FF6F00;
+            }
+            QPushButton[text="📸 THÊM BÁNH VÀO HÓA ĐƠN"]:hover {
+                background-color: #FF8F00;
+            }
+            QPushButton:disabled {
+                background-color: #BDBDBD;
+                color: #757575;
+            }
         """)
 
     # --- CAMERA ---
+    # (Không thay đổi)
     def toggle_realtime(self):
         if not self.realtime_enabled:
             for cam_id in [0, 1, 2]:
@@ -196,8 +262,9 @@ class BakeryApp(QMainWindow):
             if self.capture:
                 self.capture.release()
             self.camera_label.setText("📷 Camera đã tắt.")
+            self.current_detections = [] # (ĐÃ THÊM) Xóa phát hiện cũ
 
-    # --- CẬP NHẬT FRAME ---
+    # --- UPDATE FRAME (ĐÃ SỬA LỖI 2, 3) ---
     def update_frame(self):
         if not self.capture:
             return
@@ -208,39 +275,90 @@ class BakeryApp(QMainWindow):
         self.current_frame = frame
         display_frame = frame.copy()
 
-        # --- DETECT REALTIME ---
-        if self.realtime_enabled and self.model is not None:
+        # (ĐÃ SỬA LỖI 3) Reset danh sách phát hiện mỗi frame
+        self.current_detections = []
+        labels_to_draw = []
+
+        # Detect pipeline: YOLO .pt -> crop -> CNN .h5 classify
+        if self.realtime_enabled and self.model is not None and self.model_pt is not None:
+            detections = self.run_yolo_on_frame(frame)
+            for box in detections:
+                x1, y1, x2, y2 = box
+                w, h = x2 - x1, y2 - y1
+                if w * h < YOLO_MIN_AREA:
+                    continue
+
+                pad_w = int(w * YOLO_PADDING)
+                pad_h = int(h * YOLO_PADDING)
+                sx = max(0, x1 - pad_w)
+                sy = max(0, y1 - pad_h)
+                ex = min(frame.shape[1], x2 + pad_w)
+                ey = min(frame.shape[0], y2 + pad_h)
+                crop_bgr = frame[sy:ey, sx:ex]
+                if crop_bgr.size == 0:
+                    continue
+
+                # (ĐÃ SỬA LỖI 2: BGR/RGB)
+                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                # (ĐÃ SỬA LỖI 1: Kích thước)
+                crop_resized = cv2.resize(crop_rgb, (IMG_WIDTH, IMG_HEIGHT)) 
+                
+                img = tf.keras.utils.img_to_array(crop_resized)
+                img = np.expand_dims(img, 0) / 255.0
+                preds = self.model.predict(img, verbose=0)[0]
+                conf = float(np.max(preds))
+                cls = int(np.argmax(preds))
+
+                if conf < CNN_CONF_THRESHOLD:
+                    continue
+
+                name = CLASS_NAMES[cls]
+                label = f"{DISPLAY_NAMES.get(name,name)} ({conf*100:.1f}%)"
+                
+                # (ĐÃ SỬA LỖI 3) Chỉ lưu lại để vẽ, không thêm vào bill
+                labels_to_draw.append((label, (x1, y1, x2, y2)))
+                self.current_detections.append((name, conf, (x1, y1, x2, y2)))
+
+        # Fallback: Contours
+        elif self.realtime_enabled and self.model is not None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             blur = cv2.GaussianBlur(gray, (7, 7), 0)
             _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            now = time.time()
             for cnt in contours:
                 x, y, w, h = cv2.boundingRect(cnt)
                 if w * h < 2500:
                     continue
-                crop = frame[y:y + h, x:x + w]
-                crop_resized = cv2.resize(crop, (IMG_WIDTH, IMG_HEIGHT))
+                crop_bgr = frame[y:y + h, x:x + w]
+                
+                # (ĐÃ SỬA LỖI 2: BGR/RGB)
+                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                # (ĐÃ SỬA LỖI 1: Kích thước)
+                crop_resized = cv2.resize(crop_rgb, (IMG_WIDTH, IMG_HEIGHT))
+                
                 img = tf.keras.utils.img_to_array(crop_resized)
-                img = tf.expand_dims(img, 0)
+                img = np.expand_dims(img, 0) / 255.0
                 preds = self.model.predict(img, verbose=0)[0]
-                conf = np.max(preds)
-                cls = np.argmax(preds)
-                if conf < 0.6:
+                conf = float(np.max(preds))
+                cls = int(np.argmax(preds))
+                if conf < CNN_CONF_THRESHOLD:
                     continue
+                
                 name = CLASS_NAMES[cls]
                 label = f"{DISPLAY_NAMES[name]} ({conf * 100:.1f}%)"
-                color = (0, 255, 0)
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(display_frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
-                # tránh trùng
-                if name not in self.last_detected_time or now - self.last_detected_time[name] > 2:
-                    self.add_item_to_bill(name, PRICE_LIST.get(name, 0))
-                    self.last_detected_time[name] = now
+                # (ĐÃ SỬA LỖI 3) Chỉ lưu lại để vẽ, không thêm vào bill
+                labels_to_draw.append((label, (x, y, x + w, y + h)))
+                self.current_detections.append((name, conf, (x, y, x + w, y + h)))
+        
+        # (ĐÃ SỬA LỖI 3) Vẽ tất cả các box sau khi đã phát hiện
+        for (label, (x1, y1, x2, y2)) in labels_to_draw:
+            color = (0, 255, 0)
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(display_frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-        # HIỂN THỊ
+
+        # DISPLAY
         rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -251,7 +369,40 @@ class BakeryApp(QMainWindow):
             Qt.TransformationMode.SmoothTransformation
         ))
 
+    # --- RUN YOLO ON A FRAME ---
+    # (Không thay đổi)
+    def run_yolo_on_frame(self, frame):
+        boxes = []
+        if self.model_pt is None:
+            return boxes
+        try:
+            if ULTRAYOLO is not None and isinstance(self.model_pt, ULTRAYOLO):
+                results = self.model_pt.predict(frame, imgsz=640, conf=0.15, verbose=False)
+                r = results[0]
+                if hasattr(r, 'boxes') and r.boxes is not None:
+                    xyxy = r.boxes.xyxy.cpu().numpy() if hasattr(r.boxes, 'xyxy') else np.array([])
+                    if xyxy is not None:
+                        for b in xyxy:
+                            x1, y1, x2, y2 = map(int, b[:4])
+                            boxes.append((x1, y1, x2, y2))
+            else:
+                results = self.model_pt(frame)
+                try:
+                    res = results.xyxy[0].cpu().numpy()
+                except Exception:
+                    try:
+                        res = results[0].boxes.xyxy.cpu().numpy()
+                    except Exception:
+                        res = np.array([])
+                for b in res:
+                    x1, y1, x2, y2 = map(int, b[:4])
+                    boxes.append((x1, y1, x2, y2))
+        except Exception as e:
+            print("⚠️ Lỗi khi chạy YOLO trên frame:", e)
+        return boxes
+
     # --- ẢNH TĨNH ---
+    # (Không thay đổi)
     def select_image(self):
         file_name, _ = QFileDialog.getOpenFileName(self, "Chọn ảnh", "", "Image Files (*.png *.jpg *.jpeg)")
         if file_name:
@@ -263,37 +414,137 @@ class BakeryApp(QMainWindow):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation
             ))
+            # (ĐÃ SỬA) Tắt realtime nếu đang bật
+            if self.realtime_enabled:
+                self.toggle_realtime()
 
-    # --- NHẬN DIỆN ẢNH ---
+    # (ĐÃ THÊM LỖI 3) Hàm kích hoạt lại nút
+    def enable_detect_button(self):
+        if hasattr(self, 'btn_detect'):
+            self.btn_detect.setEnabled(True)
+            print("ℹ️ Nút 'THÊM BÁNH' đã sẵn sàng.")
+
+    # --- NHẬN DIỆN ẢNH (ĐÃ SỬA LỖI 2, 3) ---
     def run_detection(self):
+        
+        # (ĐÃ SỬA LỖI 3) Vô hiệu hóa nút
+        self.btn_detect.setEnabled(False)
+        QTimer.singleShot(DEBOUNCE_BUTTON_MS, self.enable_detect_button)
+        
         if not self.model:
-            print("⚠️ Model chưa tải!")
+            print("⚠️ Model CNN chưa tải!")
             return
-        img_array = None
-        if self.current_frame is not None:
-            img_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
-            img_resized = cv2.resize(img_rgb, (IMG_WIDTH, IMG_HEIGHT))
-            img_array = tf.keras.utils.img_to_array(img_resized)
-            img_array = tf.expand_dims(img_array, 0)
+
+        now = time.time()
+        
+        # (ĐÃ SỬA LỖI 3) Logic mới: ưu tiên realtime
+        # TRƯỜNG HỢP 1: Camera đang bật
+        if self.realtime_enabled:
+            if not self.current_detections:
+                print("ℹ️ Camera đang bật nhưng chưa thấy bánh nào.")
+                return
+            
+            print(f"✅ Thêm các bánh từ camera realtime:")
+            item_added = False
+            for (name, confidence, box) in self.current_detections:
+                # Áp dụng cơ chế chống spam 2 giây cho TỪNG LOẠI BÁNH
+                if name not in self.last_detected_time or now - self.last_detected_time[name] > 2:
+                    print(f"  -> {name}: {confidence*100:.2f}%")
+                    self.add_item_to_bill(name, PRICE_LIST.get(name, 0))
+                    self.last_detected_time[name] = now # Lưu thời gian thêm
+                    item_added = True
+                else:
+                    print(f"  -> (Bỏ qua {name}, mới thêm lúc {self.last_detected_time[name]:.0f})")
+            if not item_added:
+                 print("ℹ️ Tất cả bánh đều mới được thêm. Chờ 2 giây...")
+            return # Dừng ở đây
+
+        # TRƯỜNG HỢP 2: Dùng ảnh tĩnh (camera tắt)
         elif self.current_image_path:
-            img = tf.keras.utils.load_img(self.current_image_path, target_size=(IMG_HEIGHT, IMG_WIDTH))
-            img_array = tf.keras.utils.img_to_array(img)
-            img_array = tf.expand_dims(img_array, 0)
+            original = cv2.imread(self.current_image_path)
+            if original is None:
+                print("⚠️ Không đọc được ảnh:", self.current_image_path)
+                return
         else:
             print("⚠️ Không có ảnh hoặc frame!")
             return
 
-        preds = self.model.predict(img_array, verbose=0)[0]
-        conf = np.max(preds)
-        cls = np.argmax(preds)
-        if conf < 0.6:
-            print("😕 Không phát hiện được bánh.")
-            return
-        name = CLASS_NAMES[cls]
-        print(f"✅ {name}: {conf*100:.2f}%")
-        self.add_item_to_bill(name, PRICE_LIST.get(name, 0))
+        # Code bên dưới chỉ chạy cho TRƯỜNG HỢP 2 (Ảnh tĩnh)
+        display_frame = original.copy()
+
+        # Pipeline 1: YOLO .pt
+        if self.model_pt is not None:
+            boxes = self.run_yolo_on_frame(original)
+            for (x1, y1, x2, y2) in boxes:
+                w, h = x2 - x1, y2 - y1
+                if w * h < YOLO_MIN_AREA:
+                    continue
+                pad_w = int(w * YOLO_PADDING)
+                pad_h = int(h * YOLO_PADDING)
+                sx = max(0, x1 - pad_w)
+                sy = max(0, y1 - pad_h)
+                ex = min(original.shape[1], x2 + pad_w)
+                ey = min(original.shape[0], y2 + pad_h)
+                crop_bgr = original[sy:ey, sx:ex]
+                if crop_bgr.size == 0:
+                    continue
+
+                # (ĐÃ SỬA LỖI 2: BGR/RGB)
+                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                # (ĐÃ SỬA LỖI 1: Kích thước)
+                crop_resized = cv2.resize(crop_rgb, (IMG_WIDTH, IMG_HEIGHT))
+                
+                img = tf.keras.utils.img_to_array(crop_resized)
+                img = np.expand_dims(img, 0) / 255.0
+                preds = self.model.predict(img, verbose=0)[0]
+                conf = float(np.max(preds))
+                cls = int(np.argmax(preds))
+                if conf < CNN_CONF_THRESHOLD:
+                    continue
+                name = CLASS_NAMES[cls]
+                label = f"{DISPLAY_NAMES.get(name,name)} ({conf*100:.1f}%)"
+                color = (0, 255, 0)
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(display_frame, label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # (ĐÃ SỬA LỖI 3) Với ảnh tĩnh, không cần debounce
+                self.add_item_to_bill(name, PRICE_LIST.get(name, 0))
+
+        # Pipeline 2: Fallback (Contours)
+        else:
+            # (Đoạn này đã đúng BGR->RGB, giữ nguyên)
+            img_rgb = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+            img_resized = cv2.resize(img_rgb, (IMG_WIDTH, IMG_HEIGHT))
+            img_array = tf.keras.utils.img_to_array(img_resized)
+            img_array = np.expand_dims(img_array, 0) / 255.0
+            preds = self.model.predict(img_array, verbose=0)[0]
+            conf = float(np.max(preds))
+            cls = int(np.argmax(preds))
+            if conf < CNN_CONF_THRESHOLD:
+                print("😕 Không phát hiện được bánh.")
+            else:
+                name = CLASS_NAMES[cls]
+                print(f"✅ {name}: {conf*100:.2f}%")
+                # (ĐÃ SỬA LỖI 3) Với ảnh tĩnh, không cần debounce
+                self.add_item_to_bill(name, PRICE_LIST.get(name, 0))
+                h, w = original.shape[:2]
+                cv2.putText(display_frame, f"{DISPLAY_NAMES.get(name,name)} ({conf*100:.1f}%)", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2)
+
+        # Hiển thị ảnh tĩnh đã nhận diện
+        rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+        self.camera_label.setPixmap(pixmap.scaled(
+            self.camera_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        ))
 
     # --- BILL ---
+    # (Không thay đổi)
     def add_item_to_bill(self, cls, price):
         if cls in self.bill_items:
             self.bill_items[cls].increase_quantity()
@@ -308,13 +559,18 @@ class BakeryApp(QMainWindow):
         self.subtotal_label.setText(f"Tổng tiền hàng:\n{total:,.0f}đ")
         self.final_total_label.setText(f"{total:,.0f}đ")
 
+    # (ĐÃ SỬA LỖI 3) Kích hoạt lại nút khi xóa
     def clear_bill(self):
         for i in reversed(range(self.bill_layout.count())):
             w = self.bill_layout.takeAt(i).widget()
             if w: w.deleteLater()
         self.bill_items.clear()
         self.update_total()
+        self.last_detected_time.clear() # Xóa lịch sử debounce của item
+        self.enable_detect_button() # Kích hoạt lại nút
+        print("🗑 Bill đã được xóa.")
 
+    # (ĐÃ SỬA LỖI 3) Kích hoạt lại nút khi thanh toán
     def pay_bill(self):
         if not self.bill_items:
             print("⚠️ Bill trống!")
@@ -327,15 +583,15 @@ class BakeryApp(QMainWindow):
             if not file_exists:
                 writer.writerow(["Thời gian", "Tên bánh", "Số lượng", "Thành tiền", "Tổng hóa đơn"])
             for name, item in self.bill_items.items():
-                writer.writerow([now, name, item.quantity, item.price * item.quantity, total])
+                if item.quantity > 0:
+                    writer.writerow([now, name, item.quantity, item.price * item.quantity, total])
         print(f"💰 Thanh toán {total:,}đ — đã lưu lịch sử.")
-        self.clear_bill()
+        self.clear_bill() # Hàm này đã bao gồm cả việc kích hoạt lại nút
 
     def closeEvent(self, e):
         self.timer.stop()
         if self.capture: self.capture.release()
         e.accept()
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
