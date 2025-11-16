@@ -124,23 +124,6 @@ class BakeryApp(QMainWindow):
         else:
             print("❌ Không tìm thấy CNN .h5 model ở", MODEL_PATH)
 
-        # load YOLO .pt (for cropping only)
-        if os.path.exists(PT_MODEL_PATH):
-            if torch is None:
-                print("⚠️ torch chưa cài, không thể load YOLO .pt. Hãy cài torch + ultralytics/yolov5.")
-                self.model_pt = None
-            else:
-                try:
-                    if ULTRAYOLO is not None:
-                        self.model_pt = ULTRAYOLO(PT_MODEL_PATH)
-                    else:
-                        self.model_pt = torch.hub.load('ultralytics/yolov5', 'custom', PT_MODEL_PATH, force_reload=False)
-                except Exception as e:
-                    self.model_pt = None
-        else:
-            print("⚠️ Không tìm thấy file YOLO .pt ở", PT_MODEL_PATH)
-            self.model_pt = None
-
     # --- UI (ĐÃ SỬA LỖI 3) ---
     def setup_ui(self):
         main = QHBoxLayout()
@@ -597,4 +580,5 @@ if __name__ == "__main__":
     w = BakeryApp()
     w.show()
     sys.exit(app.exec())
+
 
